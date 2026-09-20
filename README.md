@@ -596,6 +596,101 @@ curl -X POST http://localhost:8080/recall-impact \
 }
 ```
 
+## 追溯事件审计 `POST /trace-audit`
+
+一次提交一组**按发生顺序排列**的追溯事件，按 **GTIN + 序列号（AI 01 + AI 21）**
+识别实物，逐项执行 **receive → pick → ship** 状态机，记录每项事件前后的状态与异常，
+并按最终状态汇总实物数量。
+
+- 请求体：`{"events": [{"type": "receive", "scan": "..."}]}`。`events` 按事件发生
+  顺序排列；`type` 仅接受 `"receive"` / `"pick"` / `"ship"`（其他值返回 `422`）；
+  `scan` 既可以是元素串，也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
+- 每条扫描必须包含**恰好一个 AI 01**、**恰好一个 AI 21**（序列号）、**零个或一个
+  AI 10**（批号可缺省）和**零个或一个 AI 17**（效期可缺省）；出现的重量 AI
+  （310n/320n）会被忽略。任一条扫描解析失败或缺少/重复必需 AI，整个请求返回
+  `422`，`detail.event_index` 给出出错事件下标（从 0 开始），`detail.error` 为该条
+  扫描的原始错误（结构同 `/parse`）。
+- 实物识别与一致性：**GTIN + 序列号**唯一确定一个实物。实物的批号（AI 10 原值，
+  缺省也算一种取值）与效期（AI 17 原值，缺省同理）由它的**首个事件**确定；后续
+  事件的批号或效期不一致时整个请求返回 `422`：`detail.event_index` 为当前（冲突）
+  事件下标，`detail.first_index` 为该实物首个事件的下标，`detail.error.error` 为
+  `CONFLICTING_BATCH` / `CONFLICTING_EXPIRY`。
+- 状态机：每个实物沿 `none`（尚无已完成阶段）→ `received` → `picked` →
+  `shipped` 推进，只有恰好命中下一阶段的事件才推进状态；其余事件**记录异常且
+  不推进状态**，异常码如下：
+  - `FIRST_EVENT_NOT_RECEIVE`：实物尚未 receive 就收到 pick/ship（首个事件不是
+    receive）；
+  - `DUPLICATE_STAGE`：重复刚完成的阶段（如第二次 receive、第二次 ship）；
+  - `STAGE_REGRESSION`：回退到更早的阶段（如 pick 之后又 receive、ship 之后又
+    pick）；
+  - `SKIPPED_STAGE`：跳过未完成的阶段（如未 pick 直接 ship）。
+- 响应：`events` 按输入顺序逐项给出 `event_index`、`type`、`gtin`、`serial`、
+  `state_before`、`state_after` 与 `anomaly`（事件推进状态时为 `null`，否则为含
+  `error` / `message` / `expected` / `found` 的异常对象）；`summary` 汇总各最终
+  状态的实物数量（`none` / `received` / `picked` / `shipped` 四项恒在）。
+- `events` 为空数组时返回 `200`，`events` 为空、`summary` 各项为 0。
+
+请求示例（`SN1` 走完整流程；`SN2` 重复 receive 记录异常；`SN3` 未收货先拣货）：
+
+```bash
+curl -X POST http://localhost:8080/trace-audit \
+  -H "Content-Type: application/json" \
+  -d '{"events": [{"type": "receive", "scan": "01095011015300031725013110B1\u001d21SN1"}, {"type": "pick", "scan": "01095011015300031725013110B1\u001d21SN1"}, {"type": "ship", "scan": "01095011015300031725013110B1\u001d21SN1"}, {"type": "receive", "scan": "01095011015300031725022810B2\u001d21SN2"}, {"type": "receive", "scan": "01095011015300031725022810B2\u001d21SN2"}, {"type": "pick", "scan": "010950110153000321SN3"}]}'
+```
+
+响应 `200 OK`：前三项依次推进 `none → received → picked → shipped`；第 4 项
+`SN2` 正常收货，第 5 项重复 receive 记录 `DUPLICATE_STAGE` 且状态停留
+`received`；第 6 项 `SN3` 的首个事件是 pick，记录 `FIRST_EVENT_NOT_RECEIVE`，
+状态停留 `none`：
+
+```json
+{
+  "events": [
+    {"event_index": 0, "type": "receive", "gtin": "09501101530003", "serial": "SN1", "state_before": "none",     "state_after": "received", "anomaly": null},
+    {"event_index": 1, "type": "pick",    "gtin": "09501101530003", "serial": "SN1", "state_before": "received", "state_after": "picked",   "anomaly": null},
+    {"event_index": 2, "type": "ship",    "gtin": "09501101530003", "serial": "SN1", "state_before": "picked",   "state_after": "shipped",  "anomaly": null},
+    {"event_index": 3, "type": "receive", "gtin": "09501101530003", "serial": "SN2", "state_before": "none",     "state_after": "received", "anomaly": null},
+    {"event_index": 4, "type": "receive", "gtin": "09501101530003", "serial": "SN2", "state_before": "received", "state_after": "received",
+     "anomaly": {"error": "DUPLICATE_STAGE", "message": "event 4: item GTIN '09501101530003' serial 'SN2' is already 'received'; the 'receive' stage was already completed", "expected": "the next event 'pick'", "found": "'receive'"}},
+    {"event_index": 5, "type": "pick",    "gtin": "09501101530003", "serial": "SN3", "state_before": "none",     "state_after": "none",
+     "anomaly": {"error": "FIRST_EVENT_NOT_RECEIVE", "message": "event 5: item GTIN '09501101530003' serial 'SN3' has not been received, but got a 'pick' event; the first event of an item must be 'receive'", "expected": "the next event 'receive'", "found": "'pick'"}}
+  ],
+  "summary": {"none": 1, "received": 1, "picked": 0, "shipped": 1}
+}
+```
+
+同一实物不同事件的批号或效期不一致时返回 `422`（当前下标与首次下标一并给出）：
+
+```json
+{
+  "detail": {
+    "event_index": 1,
+    "first_index": 0,
+    "error": {
+      "error": "CONFLICTING_BATCH",
+      "message": "event 1: item GTIN '09501101530003' serial 'SN1' was first seen at event 0 with batch 'B1', but this event has batch 'B2'",
+      "expected": "batch 'B1' (event 0)",
+      "found": "batch 'B2'"
+    }
+  }
+}
+```
+
+扫描解析或结构错误与 `/weight-summary` 同形，`detail.event_index` 定位出错事件：
+
+```json
+{
+  "detail": {
+    "event_index": 0,
+    "error": {
+      "error": "MISSING_AI",
+      "message": "event 0: missing required AI 21 (serial number)",
+      "expected": "exactly one AI 01 (GTIN), exactly one AI 21 (serial number), at most one AI 10 (batch/lot) and at most one AI 17 (expiry date)"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -650,16 +745,18 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
   recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
+  traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
 tests/
   test_parse.py
   test_weight_summary.py
   test_weight_pick_plan.py
   test_recall_impact.py
+  test_trace_audit.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
