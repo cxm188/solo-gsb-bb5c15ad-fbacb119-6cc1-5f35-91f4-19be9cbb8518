@@ -16,10 +16,11 @@ from .gs1 import GS1ParseError, parse
 from .pickplan import DemandValidationError, pick_plan
 from .recall import ItemConflictError, RuleValidationError, assess
 from .summary import WeightSummaryError, summarize
+from .trace import EventConflictError, audit
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -52,7 +53,17 @@ app = FastAPI(
         "expiry interval (YYMMDD, day 00 = last day of month) it matches. "
         "The response keeps the rule order and reports per-rule package "
         "counts and six-decimal half-even total weights, plus an aggregate "
-        "of the items no rule matched."
+        "of the items no rule matched. POST /trace-audit audits an ordered "
+        "stream of trace events (type receive/pick/ship plus a scan with "
+        "exactly one AI 01, exactly one AI 21 and optional AI 10/AI 17) "
+        "against the per-item receive -> pick -> ship state machine: "
+        "physical items are identified by GTIN + serial number, a first "
+        "event that is not receive, a repeated completed stage, a "
+        "regression or a skipped stage is recorded as a per-event anomaly "
+        "without advancing state, events of one item conflicting on batch "
+        "or expiry are rejected with the current and first event indices, "
+        "and the response lists every event's before/after state in input "
+        "order plus a summary counting items per final state."
     ),
 )
 
@@ -406,6 +417,91 @@ class RecallImpactResponse(BaseModel):
     unmatched: UnmatchedItems
 
 
+class TraceEvent(BaseModel):
+    type: Literal["receive", "pick", "ship"] = Field(
+        description="Lifecycle stage the event records.",
+        examples=["receive"],
+    )
+    scan: str = Field(
+        description=(
+            "Raw GS1 scan string or GS1 Digital Link URI identifying the "
+            "physical item: exactly one AI 01 (GTIN), exactly one AI 21 "
+            "(serial number), at most one AI 10 (batch/lot) and at most "
+            "one AI 17 (expiry date); weight elements are ignored."
+        ),
+        examples=["01095011015300031725013110B1\x1d21SN0001"],
+    )
+
+
+class TraceAuditRequest(BaseModel):
+    events: list[TraceEvent] = Field(
+        ...,
+        description=(
+            "Trace events in order of occurrence; each is applied to the "
+            "state machine of the physical item its scan identifies."
+        ),
+        examples=[
+            [
+                {
+                    "type": "receive",
+                    "scan": "01095011015300031725013110B1\x1d21SN0001",
+                },
+                {"type": "pick", "scan": "01095011015300031725013110B1\x1d21SN0001"},
+            ]
+        ],
+    )
+
+
+class TraceAnomaly(BaseModel):
+    """OpenAPI shape of one recorded state-machine anomaly."""
+
+    error: str = Field(description="Anomaly code, e.g. 'MISSING_RECEIVE'")
+    message: str = Field(
+        description="Human-readable description naming the event index"
+    )
+    expected: str = Field(
+        description="The event type the item's state expected next"
+    )
+    found: str = Field(description="The event type actually received")
+
+
+class TraceEventResult(BaseModel):
+    """OpenAPI shape of one audited event."""
+
+    event_index: int = Field(description="Position of the event in the request")
+    type: Literal["receive", "pick", "ship"] = Field(
+        description="Echoed event type"
+    )
+    gtin: str = Field(description="AI 01 GTIN of the item the event concerns")
+    serial: str = Field(description="AI 21 serial of the item the event concerns")
+    state_before: Literal["none", "received", "picked", "shipped"] = Field(
+        description="Item state before the event was applied"
+    )
+    state_after: Literal["none", "received", "picked", "shipped"] = Field(
+        description=(
+            "Item state after the event was applied; equal to state_before "
+            "when the event was an anomaly"
+        )
+    )
+    anomaly: TraceAnomaly | None = Field(
+        description="The recorded anomaly; null when the transition was valid"
+    )
+
+
+class TraceSummary(BaseModel):
+    """Per-final-state physical item counts; all four keys are always present."""
+
+    none: int = Field(description="Items that never completed a receive")
+    received: int = Field(description="Items received but never picked")
+    picked: int = Field(description="Items picked but never shipped")
+    shipped: int = Field(description="Items that completed the full lifecycle")
+
+
+class TraceAuditResponse(BaseModel):
+    events: list[TraceEventResult]
+    summary: TraceSummary
+
+
 SIX_PLACES = Decimal("0.000001")
 
 
@@ -588,3 +684,15 @@ def recall_impact(req: RecallImpactRequest) -> Response:
     except (WeightSummaryError, RuleValidationError, ItemConflictError) as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     return _build_recall_response(result)
+
+
+@app.post(
+    "/trace-audit",
+    response_model=TraceAuditResponse,
+)
+def trace_audit(req: TraceAuditRequest) -> TraceAuditResponse:
+    try:
+        result = audit([(e.type, e.scan) for e in req.events])
+    except (WeightSummaryError, EventConflictError) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return TraceAuditResponse(**result)
